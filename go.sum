@@ -1,0 +1,4 @@
+github.com/netlifeguru/logger v0.1.0 h1:3wPsvC9wZPSO4UHKgqGt54IQALPKD4R04OllJ5RntDk=
+github.com/netlifeguru/logger v0.1.0/go.mod h1:Fh5IwxtEO84ijKFiRfzk3keHaR7KJEppkCxIr4Wqdfs=
+golang.org/x/sys v0.45.0 h1:dO4czNzziLiiXplLQgBCEpCvXQ3dnkn0SdaZSYdQ+FY=
+golang.org/x/sys v0.45.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
