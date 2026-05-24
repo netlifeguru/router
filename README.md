@@ -53,7 +53,7 @@ This package requires Go 1.25 or newer.
 Add the package to your project using `go get`:
 
 ```bash
-go get github.com/netlifeguru/router@v0.1.0
+go get github.com/netlifeguru/router
 ```
 
 ## Quick Start
