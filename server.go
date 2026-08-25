@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,111 +19,279 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func (r *Router) write405(w http.ResponseWriter, mask int) {
+	if allow := r.maskToAllowHeader(mask); allow != "" {
+		w.Header().Set("Allow", allow)
+	}
+
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	_, _ = io.WriteString(w, "405 method not allowed")
+}
+
+func (r *Router) validatePathEntry(ctx *Context, entry *routeEntry) bool {
+	patterns := entry.Patterns
+	segments := ctx.segments
+
+	for i := 0; i < len(patterns); i++ {
+		p := patterns[i]
+		segment := segments[i].Value
+
+		switch p.Type {
+		case isString:
+		case isMatch:
+			if !p.RegexCompiled.MatchString(segment) {
+				return false
+			}
+
+		case isPattern:
+			if !p.Fn(segment) {
+				return false
+			}
+
+		case isSubmatch:
+			if !p.RegexCompiled.MatchString(segment) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func (r *Router) finishRequest(w http.ResponseWriter, req *http.Request, ctx *Context) {
+	if message := recover(); message != nil {
+		r.logError(req, message)
+
+		if r.recovery != nil {
+			func() {
+				defer func() {
+					if recoveryPanic := recover(); recoveryPanic != nil {
+						r.logError(req, recoveryPanic)
+
+						http.Error(w, "Recovery middleware failed: an error occurred while executing the recovery handler.", http.StatusInternalServerError)
+					}
+				}()
+
+				r.recovery(w, req, ctx)
+			}()
+		} else {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+	}
+
+	if ctx != nil {
+		putContext(ctx)
+	}
+}
+
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	ctx := getContext()
+
+	defer r.finishRequest(w, req, ctx)
+
+	var foundPath bool
+	var allowedMask int
+
+	t := r.staticRoutes[req.URL.Path]
+
+	bitmask := r.getBitmaskIndex(req.Method)
+
+	if len(t) > 0 {
+		for i := 0; i < len(t); i++ {
+			entry := &t[i]
+			if entry.Bitmask&bitmask != 0 {
+				ctx.handler = entry
+				entry.Handler(w, req, ctx)
+				return
+			}
+			allowedMask |= entry.Bitmask
+		}
+
+		r.write405(w, allowedMask)
+		return
+	} else if ok := r.search(req.URL.Path, ctx, bitmask); ok >= 1 {
+		foundPath = true
+
+		if ok == 1 {
+			entry := ctx.handler
+			if entry.Validation {
+				if !r.validatePathEntry(ctx, entry) {
+					foundPath = false
+				}
+			}
+
+			if foundPath {
+				entry.Handler(w, req, ctx)
+				return
+			}
+		} else if ok == 2 {
+			allowedMask = ctx.allowedMask
+		}
+	}
+
+	if foundPath {
+		r.write405(w, allowedMask)
+		return
+	}
+
+	if r.notFound != nil {
+		r.notFound(w, req, ctx)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write(notFound)
+	}
+}
+
 func (r *Router) isConsoleLoggingEnabled() bool {
 	return slog.Default().Enabled(context.Background(), slog.Level(-10))
 }
 
-func (r *Router) MultiListenAndServe(listeners Listeners) error {
+func (r *Router) newHTTPServer() *http.Server {
+	return &http.Server{
+		Handler:           r,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+	}
+}
 
+func (r *Router) startServer(listener net.Listener, addr string, servers *[]*http.Server, wg *sync.WaitGroup, errCh chan<- error) {
+	server := r.newHTTPServer()
+	*servers = append(*servers, server)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		err := server.Serve(listener)
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+
+		select {
+		case errCh <- fmt.Errorf("%w: %q: %w", ErrServeFailed, addr, err):
+		default:
+		}
+	}()
+}
+
+func validateListenAddress(listenAddr string) error {
+	_, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return fmt.Errorf("%w: %q: %w", ErrInvalidListenAddress, listenAddr, err)
+	}
+
+	if _, err = strconv.Atoi(portStr); err != nil {
+		return fmt.Errorf("%w: %q: %w", ErrInvalidListenPort, listenAddr, err)
+	}
+
+	return nil
+}
+
+func reusePortListenConfig() net.ListenConfig {
+	return net.ListenConfig{
+		Control: func(network string, address string, c syscall.RawConn) error {
+			var socketErr error
+
+			if err := c.Control(func(fd uintptr) {
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+					socketErr = err
+					return
+				}
+
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+					socketErr = err
+				}
+			}); err != nil {
+				return err
+			}
+
+			return socketErr
+		},
+	}
+}
+
+func (r *Router) shutdownServers(servers []*http.Server, consoleEnabled bool) {
+	if len(servers) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(len(servers))
+
+	for i := 0; i < len(servers); i++ {
+		server := servers[i]
+
+		go func() {
+			defer wg.Done()
+
+			if err := server.Shutdown(ctx); err != nil && consoleEnabled {
+				slog.Error("Server shutdown error", "error", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func (r *Router) MultiListenAndServe(listeners Listeners) error {
 	consoleEnabled := r.isConsoleLoggingEnabled()
 
-	workers := runtime.NumCPU()
-	runtime.GOMAXPROCS(workers)
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
 
 	if consoleEnabled {
 		slog.Info("Starting server")
-		slog.Info("System resources", "cpu_cores", workers)
+		slog.Info("System resources", "workers", workers, "logical_cpus", runtime.NumCPU())
 	}
 
-	var (
-		wg           sync.WaitGroup
-		servers      []*http.Server
-		mu           sync.Mutex
-		startErrChan = make(chan error, len(listeners)*workers+1)
-	)
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	for _, ln := range listeners {
-		listenAddr := ln.Addr
-
-		_, portStr, err := net.SplitHostPort(listenAddr)
-		if err != nil {
-			return fmt.Errorf("%w: %q: %w", ErrInvalidListenAddress, listenAddr, err)
+	for i := 0; i < len(listeners); i++ {
+		if err := validateListenAddress(listeners[i].Addr); err != nil {
+			return err
 		}
-		_, err = strconv.Atoi(portStr)
-		if err != nil {
-			return fmt.Errorf("%w: %q: %w", ErrInvalidListenPort, listenAddr, err)
-		}
+	}
 
-		if consoleEnabled {
-			slog.Info("web server started",
-				"server", serverName,
-				"version", serverVersion,
-				"listen_addr", listenAddr,
-			)
-		}
+	var wg sync.WaitGroup
+
+	servers := make([]*http.Server, 0, len(listeners)*workers)
+	serveErrCh := make(chan error, len(listeners)*workers+1)
+
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	for i := 0; i < len(listeners); i++ {
+		listenAddr := listeners[i].Addr
 
 		useReusePort := runtime.GOOS != "windows"
 		var reuseErr error
 
 		if useReusePort {
-			lc := net.ListenConfig{
-				Control: func(network, address string, c syscall.RawConn) error {
-					var sockErr error
-					if err := c.Control(func(fd uintptr) {
-						_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-						if e := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); e != nil {
-							sockErr = e
-						}
-					}); err != nil {
-						return err
-					}
-					return sockErr
-				},
-			}
+			lc := reusePortListenConfig()
 
 			firstListener, err := lc.Listen(context.Background(), "tcp", listenAddr)
 
 			if err == nil {
-				for i := 0; i < workers; i++ {
-					var listener net.Listener
+				r.startServer(firstListener, listenAddr, &servers, &wg, serveErrCh)
 
-					if i == 0 {
-						listener = firstListener
-					} else {
-						var lErr error
-						listener, lErr = lc.Listen(context.Background(), "tcp", listenAddr)
-						if lErr != nil {
-							slog.Error("REUSEPORT listen failed", "worker", i, "err", lErr)
-							continue
-						}
+				for worker := 1; worker < workers; worker++ {
+					listener, err := lc.Listen(
+						context.Background(),
+						"tcp",
+						listenAddr,
+					)
+					if err != nil {
+						slog.Error("REUSEPORT listen failed", "worker", worker, "listen_addr", listenAddr, "err", err)
+						continue
 					}
 
-					wg.Add(1)
-					go func(l net.Listener, addr string) {
-						defer wg.Done()
-
-						server := &http.Server{
-							Handler:           r.handler(),
-							ReadTimeout:       5 * time.Second,
-							WriteTimeout:      10 * time.Second,
-							IdleTimeout:       120 * time.Second,
-							ReadHeaderTimeout: 2 * time.Second,
-						}
-
-						mu.Lock()
-						servers = append(servers, server)
-						mu.Unlock()
-
-						if err := server.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-							select {
-							case startErrChan <- fmt.Errorf("%w: %q: %w", ErrServeFailed, addr, err):
-							default:
-							}
-						}
-					}(listener, listenAddr)
+					r.startServer(listener, listenAddr, &servers, &wg, serveErrCh)
 				}
 			} else {
 				useReusePort = false
@@ -131,47 +300,38 @@ func (r *Router) MultiListenAndServe(listeners Listeners) error {
 		}
 
 		if !useReusePort {
-			slog.Error("REUSEPORT unavailable; falling back to single listener",
-				"listen_addr", listenAddr,
-				"error", reuseErr,
-			)
-
-			l, err := net.Listen("tcp", listenAddr)
-			if err != nil {
-				return fmt.Errorf("%w: %q: %w", ErrListenFailed, listenAddr, err)
+			if reuseErr != nil {
+				slog.Error("REUSEPORT unavailable; falling back to single listener", "listen_addr", listenAddr, "error", reuseErr)
 			}
 
-			wg.Add(1)
-			go func(l net.Listener, addr string) {
-				defer wg.Done()
+			listener, err := net.Listen("tcp", listenAddr)
+			if err != nil {
+				r.shutdownServers(servers, consoleEnabled)
+				wg.Wait()
 
-				server := &http.Server{
-					Handler:           r.handler(),
-					ReadTimeout:       5 * time.Second,
-					WriteTimeout:      10 * time.Second,
-					IdleTimeout:       120 * time.Second,
-					ReadHeaderTimeout: 2 * time.Second,
-				}
+				return fmt.Errorf(
+					"%w: %q: %w",
+					ErrListenFailed,
+					listenAddr,
+					err,
+				)
+			}
 
-				mu.Lock()
-				servers = append(servers, server)
-				mu.Unlock()
+			r.startServer(listener, listenAddr, &servers, &wg, serveErrCh)
+		}
 
-				if err := server.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					select {
-					case startErrChan <- fmt.Errorf("%w: %q: %w", ErrServeFailed, addr, err):
-					default:
-					}
-				}
-			}(l, listenAddr)
+		if consoleEnabled {
+			slog.Info("web server started", "server", serverName, "version", serverVersion, "listen_addr", listenAddr)
 		}
 	}
 
 	select {
-	case err := <-startErrChan:
-		r.shutdownServers(servers, &mu, consoleEnabled)
+	case err := <-serveErrCh:
+		r.shutdownServers(servers, consoleEnabled)
+		wg.Wait()
 		return err
-	case <-stop:
+
+	case <-signalCtx.Done():
 	}
 
 	r.SetReady(false)
@@ -180,23 +340,7 @@ func (r *Router) MultiListenAndServe(listeners Listeners) error {
 		slog.Info("Shutdown signal received. Shutting down servers...")
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	mu.Lock()
-	for _, srv := range servers {
-		wg.Add(1)
-		go func(s *http.Server) {
-			defer wg.Done()
-			if err := s.Shutdown(shutdownCtx); err != nil {
-				if consoleEnabled {
-					slog.Info("Server shutdown error", "error", err)
-				}
-			}
-		}(srv)
-	}
-	mu.Unlock()
-
+	r.shutdownServers(servers, consoleEnabled)
 	wg.Wait()
 
 	if consoleEnabled {
@@ -204,22 +348,6 @@ func (r *Router) MultiListenAndServe(listeners Listeners) error {
 	}
 
 	return nil
-}
-
-func (r *Router) shutdownServers(servers []*http.Server, mu *sync.Mutex, consoleEnabled bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	for _, srv := range servers {
-		if err := srv.Shutdown(ctx); err != nil {
-			if consoleEnabled {
-				slog.Error("Shutdown error during cleanup", "err", err)
-			}
-		}
-	}
 }
 
 func (r *Router) ListenAndServe(addr string) error {

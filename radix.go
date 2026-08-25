@@ -1,9 +1,10 @@
 package router
 
 type radixNode struct {
-	prefix string
+	prefix      string
+	starAtPlus1 int
 
-	byFirst [256][]*radixNode
+	byFirst [256]*radixNode
 	star    []*radixNode
 	glob    []*radixNode
 
@@ -11,6 +12,24 @@ type radixNode struct {
 
 	isLeaf  bool
 	entries []routeEntry
+}
+
+func (n *radixNode) setPrefix(prefix string) {
+	n.prefix = prefix
+	n.starAtPlus1 = 0
+
+	for i := 0; i < len(prefix); i++ {
+		if prefix[i] == '*' {
+			n.starAtPlus1 = i + 1
+			return
+		}
+	}
+}
+
+func newRadixNode(prefix string) *radixNode {
+	n := &radixNode{}
+	n.setPrefix(prefix)
+	return n
 }
 
 func (n *radixNode) addChild(ch *radixNode) {
@@ -26,19 +45,18 @@ func (n *radixNode) addChild(ch *radixNode) {
 	var idx byte
 	if len(ch.prefix) > 0 {
 		idx = ch.prefix[0]
-	} else {
-		idx = 0
 	}
 
-	if len(n.byFirst[idx]) == 0 {
+	if n.byFirst[idx] == nil {
 		n.usedIndices = append(n.usedIndices, idx)
 	}
-
-	n.byFirst[idx] = append(n.byFirst[idx], ch)
+	n.byFirst[idx] = ch
 }
 
 func (n *radixNode) rebuildIndex(children []*radixNode) {
-	n.byFirst = [256][]*radixNode{}
+	for i := 0; i < len(n.usedIndices); i++ {
+		n.byFirst[n.usedIndices[i]] = nil
+	}
 	n.usedIndices = n.usedIndices[:0]
 	n.star = n.star[:0]
 	n.glob = n.glob[:0]
@@ -53,6 +71,7 @@ func longestCommonPrefixStr(a, b string) int {
 	if len(b) < n {
 		n = len(b)
 	}
+
 	i := 0
 	for i < n && a[i] == b[i] {
 		i++
@@ -60,7 +79,8 @@ func longestCommonPrefixStr(a, b string) int {
 	return i
 }
 
-func matchPrefixWithStarStr(prefix, key string, ctx *Context) (int, bool) {
+func matchNodePrefix(n *radixNode, key string, ctx *Context) (int, bool) {
+	prefix := n.prefix
 	pLen := len(prefix)
 	kLen := len(key)
 
@@ -68,16 +88,30 @@ func matchPrefixWithStarStr(prefix, key string, ctx *Context) (int, bool) {
 		return 0, key == ""
 	}
 
-	origSegLen := len(ctx.segments)
-	i, j := 0, 0
+	if n.starAtPlus1 == 0 {
+		if kLen < pLen || key[:pLen] != prefix {
+			return 0, false
+		}
+		return pLen, true
+	}
 
+	origSegLen := len(ctx.segments)
+	star := n.starAtPlus1 - 1
+
+	if star > 0 {
+		if kLen < star || key[:star] != prefix[:star] {
+			return 0, false
+		}
+	}
+
+	i, j := star, star
 	for i < pLen {
 		c := prefix[i]
 
 		if c == '*' {
 			if i+1 < pLen && prefix[i+1] == '*' {
 				if i+2 != pLen {
-					ctx.segments = ctx.segments[:origSegLen] // Rollback
+					ctx.segments = ctx.segments[:origSegLen]
 					return 0, false
 				}
 
@@ -95,7 +129,7 @@ func matchPrefixWithStarStr(prefix, key string, ctx *Context) (int, bool) {
 		}
 
 		if j >= kLen || c != key[j] {
-			ctx.segments = ctx.segments[:origSegLen] // Rollback
+			ctx.segments = ctx.segments[:origSegLen]
 			return 0, false
 		}
 		i++
@@ -117,10 +151,8 @@ func (r *Router) insert(node *radixNode, key string, entry routeEntry) {
 	}
 
 	b := key[0]
-
-	c := node.byFirst[b]
-	for i := 0; i < len(c); i++ {
-		if r.tryInsertIntoChild(c[i], key, entry) {
+	if child := node.byFirst[b]; child != nil {
+		if r.tryInsertIntoChild(child, key, entry) {
 			return
 		}
 	}
@@ -137,11 +169,10 @@ func (r *Router) insert(node *radixNode, key string, entry routeEntry) {
 		}
 	}
 
-	node.addChild(&radixNode{
-		prefix:  key,
-		isLeaf:  true,
-		entries: []routeEntry{entry},
-	})
+	child := newRadixNode(key)
+	child.isLeaf = true
+	child.entries = []routeEntry{entry}
+	node.addChild(child)
 }
 
 func (r *Router) tryInsertIntoChild(child *radixNode, key string, entry routeEntry) bool {
@@ -164,23 +195,23 @@ func (r *Router) tryInsertIntoChild(child *radixNode, key string, entry routeEnt
 	}
 
 	if lcp < len(child.prefix) {
-		newChild := &radixNode{
-			prefix:  child.prefix[lcp:],
-			isLeaf:  child.isLeaf,
-			entries: child.entries,
-		}
+		newChild := newRadixNode(child.prefix[lcp:])
+		newChild.isLeaf = child.isLeaf
+		newChild.entries = child.entries
 
-		var moved []*radixNode
+		moved := make([]*radixNode, 0, len(child.usedIndices)+len(child.star)+len(child.glob))
 		for i := 0; i < len(child.usedIndices); i++ {
 			idx := child.usedIndices[i]
-			moved = append(moved, child.byFirst[idx]...)
+			if ch := child.byFirst[idx]; ch != nil {
+				moved = append(moved, ch)
+			}
 		}
 		moved = append(moved, child.star...)
 		moved = append(moved, child.glob...)
 
 		newChild.rebuildIndex(moved)
 
-		child.prefix = child.prefix[:lcp]
+		child.setPrefix(child.prefix[:lcp])
 		child.isLeaf = false
 		child.entries = nil
 		child.rebuildIndex([]*radixNode{newChild})
@@ -199,48 +230,33 @@ func (r *Router) search(key string, ctx *Context, bitmask int) int {
 	return r.dfs(r.radixRoot, key, ctx, bitmask)
 }
 
-func (r *Router) dfs(n *radixNode, k string, ctx *Context, bitmask int) int {
-	if len(k) == 0 {
+func (r *Router) dfs(n *radixNode, key string, ctx *Context, bitmask int) int {
+	if len(key) == 0 {
 		if n.isLeaf {
 			var combinedMask int
 
 			for ei := 0; ei < len(n.entries); ei++ {
-				combinedMask |= n.entries[ei].Bitmask
+				entry := &n.entries[ei]
+				combinedMask |= entry.Bitmask
 
-				if n.entries[ei].Bitmask&bitmask != 0 {
-					ctx.handler = n.entries[ei]
-
-					pn := len(ctx.handler.Parts)
-					sn := len(ctx.segments)
-					if sn < pn {
-						pn = sn
-					}
-
-					for pi := 0; pi < pn; pi++ {
-						ctx.params = append(ctx.params, par{
-							Key:   ctx.handler.Parts[pi],
-							Value: ctx.segments[pi].Value,
-						})
-					}
+				if entry.Bitmask&bitmask != 0 {
+					ctx.handler = entry
 					return 1
 				}
 			}
 
 			if len(n.entries) > 0 {
-				ctx.handler.Bitmask = combinedMask
+				ctx.allowedMask = combinedMask
 				return 2
 			}
 		}
 		return 0
 	}
 
-	children := n.byFirst[k[0]]
-	for i := 0; i < len(children); i++ {
-		ch := children[i]
-
+	if ch := n.byFirst[key[0]]; ch != nil {
 		segLen := len(ctx.segments)
-		if cons, ok := matchPrefixWithStarStr(ch.prefix, k, ctx); ok {
-			if res := r.dfs(ch, k[cons:], ctx, bitmask); res > 0 {
+		if cons, ok := matchNodePrefix(ch, key, ctx); ok {
+			if res := r.dfs(ch, key[cons:], ctx, bitmask); res > 0 {
 				return res
 			}
 		}
@@ -249,10 +265,9 @@ func (r *Router) dfs(n *radixNode, k string, ctx *Context, bitmask int) int {
 
 	for i := 0; i < len(n.star); i++ {
 		ch := n.star[i]
-
 		segLen := len(ctx.segments)
-		if cons, ok := matchPrefixWithStarStr(ch.prefix, k, ctx); ok {
-			if res := r.dfs(ch, k[cons:], ctx, bitmask); res > 0 {
+		if cons, ok := matchNodePrefix(ch, key, ctx); ok {
+			if res := r.dfs(ch, key[cons:], ctx, bitmask); res > 0 {
 				return res
 			}
 		}
@@ -261,10 +276,9 @@ func (r *Router) dfs(n *radixNode, k string, ctx *Context, bitmask int) int {
 
 	for i := 0; i < len(n.glob); i++ {
 		ch := n.glob[i]
-
 		segLen := len(ctx.segments)
-		if cons, ok := matchPrefixWithStarStr(ch.prefix, k, ctx); ok {
-			if res := r.dfs(ch, k[cons:], ctx, bitmask); res > 0 {
+		if cons, ok := matchNodePrefix(ch, key, ctx); ok {
+			if res := r.dfs(ch, key[cons:], ctx, bitmask); res > 0 {
 				return res
 			}
 		}

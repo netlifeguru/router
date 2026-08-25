@@ -9,6 +9,55 @@ This project follows:
 
 ---
 
+## [1.1.0] - 2026-08-25
+
+### Added
+
+- Architecture-aware cache-line padding for request contexts to reduce false sharing under high concurrency
+- Platform-specific cache-line definitions using Go build constraints
+- Additional tests covering request context memory layout and cache-line alignment assumptions
+- Performance diagnostics for parallel route matching and request context reuse
+
+### Changed
+
+- Optimized radix-tree dynamic route matching
+- Replaced per-request route entry copies with direct route entry references
+- Removed redundant route parameter materialization from the request hot path
+- Route parameters are now resolved directly from matched route parts and captured segments
+- Optimized radix child lookup for static path segments
+- Reduced dynamic route traversal overhead
+- Improved wildcard and parameter prefix matching
+- Simplified request context state and reset logic
+- Improved request context reuse through `sync.Pool`
+- Updated mounted handler path parameter propagation for the optimized context representation
+- Updated rate limiter route lookup for the optimized request context
+- Improved parallel request scalability on multi-core systems
+- Updated internal tests to match the optimized router and context implementation
+
+### Performance
+
+- Maintains zero allocations in the router request hot path
+- Improved single-parameter route matching performance
+- Improved deeply parameterized route matching performance
+- Improved large dynamic route table lookup performance
+- Reduced request routing overhead under parallel workloads
+- Eliminated significant false-sharing overhead observed on Apple Silicon under high concurrency
+- Improved scaling across multiple CPU cores while preserving `0 B/op` and `0 allocs/op`
+
+### Fixed
+
+- Fixed request context cache-line contention under high parallelism
+- Fixed performance instability caused by false sharing between pooled request contexts
+- Fixed tests relying on removed internal request context fields and previous radix-tree indexing structures
+
+### Notes
+
+- These changes are internal and do not intentionally change the public router API.
+- Request context padding is architecture-aware because cache-line characteristics differ between CPU architectures.
+- `GOMAXPROCS` is intentionally left under the control of the Go runtime or application.
+- Router matching performance has been validated with serial and parallel benchmarks on Apple M2 Max.
+- Server listener and `SO_REUSEPORT` worker configuration remain separate from these router hot-path optimizations.
+
 ## [0.1.0] - 2026-05-23
 
 ### Added

@@ -75,10 +75,16 @@ func (m *middlewareGroup) Use(mi Middleware) {
 
 func (m *middlewareGroup) Mount(prefix string, handler http.Handler) {
 	wrappedAdapter := m.middlewareWrapper(func(w http.ResponseWriter, req *http.Request, ctx *Context) {
-		n := len(ctx.params)
+		if ctx.handler != nil {
+			parts := ctx.handler.Parts
+			n := len(parts)
+			if len(ctx.segments) < n {
+				n = len(ctx.segments)
+			}
 
-		for i := 0; i < n; i++ {
-			req.SetPathValue(ctx.params[i].Key, ctx.params[i].Value)
+			for i := 0; i < n; i++ {
+				req.SetPathValue(parts[i], ctx.segments[i].Value)
+			}
 		}
 
 		handler.ServeHTTP(w, req)

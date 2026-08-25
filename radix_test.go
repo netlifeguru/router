@@ -33,14 +33,15 @@ func TestLongestCommonPrefixStr(t *testing.T) {
 	}
 }
 
-func TestMatchPrefixWithStarStr_NoStarExactMatch(t *testing.T) {
+func TestMatchNodePrefix_NoStarExactMatch(t *testing.T) {
 	ctx := &Context{}
 	prefix := "/users/"
 	key := "/users/123"
 
-	consumed, ok := matchPrefixWithStarStr(prefix, key, ctx)
+	node := newRadixNode(prefix)
+	consumed, ok := matchNodePrefix(node, key, ctx)
 	if !ok {
-		t.Fatalf("expected matchPrefixWithStarStr to match, got ok=false")
+		t.Fatalf("expected matchNodePrefix to match, got ok=false")
 	}
 	if consumed != len(prefix) {
 		t.Errorf("expected consumed=%d, got %d", len(prefix), consumed)
@@ -50,14 +51,15 @@ func TestMatchPrefixWithStarStr_NoStarExactMatch(t *testing.T) {
 	}
 }
 
-func TestMatchPrefixWithStarStr_StarCapturesSegment(t *testing.T) {
+func TestMatchNodePrefix_StarCapturesSegment(t *testing.T) {
 	ctx := &Context{}
 	prefix := "/files/*/edit"
 	key := "/files/foo/edit"
 
-	consumed, ok := matchPrefixWithStarStr(prefix, key, ctx)
+	node := newRadixNode(prefix)
+	consumed, ok := matchNodePrefix(node, key, ctx)
 	if !ok {
-		t.Fatalf("expected matchPrefixWithStarStr to match, got ok=false")
+		t.Fatalf("expected matchNodePrefix to match, got ok=false")
 	}
 
 	if consumed != len(key) {
@@ -72,14 +74,15 @@ func TestMatchPrefixWithStarStr_StarCapturesSegment(t *testing.T) {
 	}
 }
 
-func TestMatchPrefixWithStarStr_StarAtEndLeavesRemainder(t *testing.T) {
+func TestMatchNodePrefix_StarAtEndLeavesRemainder(t *testing.T) {
 	ctx := &Context{}
 	prefix := "/files/*"
 	key := "/files/foo/bar"
 
-	consumed, ok := matchPrefixWithStarStr(prefix, key, ctx)
+	node := newRadixNode(prefix)
+	consumed, ok := matchNodePrefix(node, key, ctx)
 	if !ok {
-		t.Fatalf("expected matchPrefixWithStarStr to match, got ok=false")
+		t.Fatalf("expected matchNodePrefix to match, got ok=false")
 	}
 
 	expectedConsumed := len("/files/foo")
@@ -92,12 +95,13 @@ func TestMatchPrefixWithStarStr_StarAtEndLeavesRemainder(t *testing.T) {
 	}
 }
 
-func TestMatchPrefixWithStarStr_NoMatch(t *testing.T) {
+func TestMatchNodePrefix_NoMatch(t *testing.T) {
 	ctx := &Context{}
 	prefix := "/users/*"
 	key := "/posts/123"
 
-	consumed, ok := matchPrefixWithStarStr(prefix, key, ctx)
+	node := newRadixNode(prefix)
+	consumed, ok := matchNodePrefix(node, key, ctx)
 	if ok {
 		t.Fatalf("expected no match, got ok=true, consumed=%d", consumed)
 	}
@@ -106,7 +110,7 @@ func TestMatchPrefixWithStarStr_NoMatch(t *testing.T) {
 func TestRadixNodeAddChild_StarGlobAndNonStar(t *testing.T) {
 	n := &radixNode{}
 
-	starChild := &radixNode{prefix: "*wild"}
+	starChild := newRadixNode("*wild")
 	n.addChild(starChild)
 
 	if len(n.star) != 1 {
@@ -116,7 +120,7 @@ func TestRadixNodeAddChild_StarGlobAndNonStar(t *testing.T) {
 		t.Errorf("unexpected star child stored")
 	}
 
-	globChild := &radixNode{prefix: "**wild"}
+	globChild := newRadixNode("**wild")
 	n.addChild(globChild)
 
 	if len(n.glob) != 1 {
@@ -126,15 +130,11 @@ func TestRadixNodeAddChild_StarGlobAndNonStar(t *testing.T) {
 		t.Errorf("unexpected glob child stored")
 	}
 
-	normalChild := &radixNode{prefix: "a"}
+	normalChild := newRadixNode("a")
 	n.addChild(normalChild)
 
 	idx := normalChild.prefix[0]
-	if len(n.byFirst[idx]) != 1 {
-		t.Fatalf("expected 1 child at index %d, got %d", idx, len(n.byFirst[idx]))
-	}
-
-	if n.byFirst[idx][0] != normalChild {
+	if n.byFirst[idx] != normalChild {
 		t.Errorf("unexpected child at byFirst[%d]", idx)
 	}
 
@@ -146,10 +146,10 @@ func TestRadixNodeAddChild_StarGlobAndNonStar(t *testing.T) {
 func TestRadixNodeRebuildIndex(t *testing.T) {
 	parent := &radixNode{}
 
-	c1 := &radixNode{prefix: "*wild"}
-	c2 := &radixNode{prefix: "a"}
-	c3 := &radixNode{prefix: "b"}
-	c4 := &radixNode{prefix: "**wild"}
+	c1 := newRadixNode("*wild")
+	c2 := newRadixNode("a")
+	c3 := newRadixNode("b")
+	c4 := newRadixNode("**wild")
 
 	children := []*radixNode{c1, c2, c3, c4}
 	parent.rebuildIndex(children)
@@ -166,10 +166,10 @@ func TestRadixNodeRebuildIndex(t *testing.T) {
 		t.Fatalf("expected 2 usedIndices, got %d", len(parent.usedIndices))
 	}
 
-	if len(parent.byFirst['a']) != 1 || parent.byFirst['a'][0] != c2 {
+	if parent.byFirst['a'] != c2 {
 		t.Errorf("expected child c2 at 'a', got %+v", parent.byFirst['a'])
 	}
-	if len(parent.byFirst['b']) != 1 || parent.byFirst['b'][0] != c3 {
+	if parent.byFirst['b'] != c3 {
 		t.Errorf("expected child c3 at 'b', got %+v", parent.byFirst['b'])
 	}
 }
@@ -190,11 +190,11 @@ func TestRouterInsertAndSearch_SimpleRoute(t *testing.T) {
 		t.Fatalf("expected search result 1, got %d", res)
 	}
 
-	if ctx.handler.Bitmask != 1 {
-		t.Errorf("expected handler bitmask 1, got %d", ctx.handler.Bitmask)
+	if ctx.handler == nil || ctx.handler.Bitmask != 1 {
+		t.Fatalf("expected handler bitmask 1, got %#v", ctx.handler)
 	}
-	if len(ctx.params) != 0 {
-		t.Errorf("expected no params, got %v", ctx.params)
+	if len(ctx.segments) != 0 {
+		t.Errorf("expected no captured segments, got %v", ctx.segments)
 	}
 }
 
@@ -213,15 +213,11 @@ func TestRouterInsertAndSearch_WildcardRoute_Matched(t *testing.T) {
 		t.Fatalf("expected search result 1, got %d", res)
 	}
 
-	if ctx.handler.Bitmask != 1 {
-		t.Errorf("expected handler bitmask 1, got %d", ctx.handler.Bitmask)
+	if ctx.handler == nil || ctx.handler.Bitmask != 1 {
+		t.Fatalf("expected handler bitmask 1, got %#v", ctx.handler)
 	}
-
-	if len(ctx.params) != 1 {
-		t.Fatalf("expected 1 param, got %d", len(ctx.params))
-	}
-	if ctx.params[0].Key != "id" || ctx.params[0].Value != "123" {
-		t.Errorf("expected param id=123, got %+v", ctx.params[0])
+	if got := ctx.Param("id"); got != "123" {
+		t.Errorf("expected Param(\"id\")=123, got %q", got)
 	}
 }
 
@@ -240,15 +236,11 @@ func TestRouterInsertAndSearch_GlobRoute_Matched(t *testing.T) {
 		t.Fatalf("expected search result 1, got %d", res)
 	}
 
-	if ctx.handler.Bitmask != 1 {
-		t.Errorf("expected handler bitmask 1, got %d", ctx.handler.Bitmask)
+	if ctx.handler == nil || ctx.handler.Bitmask != 1 {
+		t.Fatalf("expected handler bitmask 1, got %#v", ctx.handler)
 	}
-
-	if len(ctx.params) != 1 {
-		t.Fatalf("expected 1 param, got %d", len(ctx.params))
-	}
-	if ctx.params[0].Key != "wildcard" || ctx.params[0].Value != "images/logo.png" {
-		t.Errorf("expected param wildcard=images/logo.png, got %+v", ctx.params[0])
+	if got := ctx.Param("wildcard"); got != "images/logo.png" {
+		t.Errorf("expected Param(\"wildcard\")=images/logo.png, got %q", got)
 	}
 }
 
@@ -267,11 +259,14 @@ func TestRouterInsertAndSearch_WildcardRoute_BitmaskMismatch(t *testing.T) {
 		t.Fatalf("expected search result 2, got %d", res)
 	}
 
-	if ctx.handler.Bitmask != 1 {
-		t.Errorf("expected combined mask 1 in ctx.handler.Bitmask, got %d", ctx.handler.Bitmask)
+	if ctx.allowedMask != 1 {
+		t.Errorf("expected combined mask 1 in ctx.allowedMask, got %d", ctx.allowedMask)
 	}
-	if len(ctx.params) != 0 {
-		t.Errorf("expected no params filled on bitmask mismatch, got %v", ctx.params)
+	if ctx.handler != nil {
+		t.Errorf("expected no handler selected on bitmask mismatch, got %#v", ctx.handler)
+	}
+	if got := ctx.Param("id"); got != "" {
+		t.Errorf("expected Param(\"id\") to be empty on bitmask mismatch, got %q", got)
 	}
 }
 
@@ -296,17 +291,16 @@ func TestRouterInsert_SplitsNodeOnPartialPrefix(t *testing.T) {
 		t.Fatalf("expected res=1 for /abxyz, got %d", res2)
 	}
 
-	rootChildren := r.radixRoot.byFirst['/']
-	if len(rootChildren) == 0 {
-		t.Fatalf("expected at least one child at root for '/'")
+	child := r.radixRoot.byFirst['/']
+	if child == nil {
+		t.Fatalf("expected child at root for '/'")
 	}
-	child := rootChildren[0]
 	if !strings.HasPrefix("/abcde", child.prefix) && !strings.HasPrefix("/abxyz", child.prefix) {
 		t.Errorf("expected child prefix to be common prefix, got %q", child.prefix)
 	}
 }
 
-func TestMatchPrefixWithStarStr(t *testing.T) {
+func TestMatchNodePrefix(t *testing.T) {
 	tests := []struct {
 		name      string
 		prefix    string
@@ -409,7 +403,8 @@ func TestMatchPrefixWithStarStr(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := &Context{}
-			gotLen, gotMatch := matchPrefixWithStarStr(tt.prefix, tt.key, ctx)
+			node := newRadixNode(tt.prefix)
+			gotLen, gotMatch := matchNodePrefix(node, tt.key, ctx)
 
 			if gotLen != tt.wantLen {
 				t.Errorf("matchLen = %v, want %v", gotLen, tt.wantLen)

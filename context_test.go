@@ -38,9 +38,11 @@ func TestContextParam(t *testing.T) {
 	ctx := getContext()
 	defer putContext(ctx)
 
-	ctx.params = append(ctx.params,
-		par{Key: "id", Value: "42"},
-		par{Key: "slug", Value: "test-slug"},
+	entry := routeEntry{Parts: activeParts{"id", "slug"}}
+	ctx.handler = &entry
+	ctx.segments = append(ctx.segments,
+		seg{Value: "42"},
+		seg{Value: "test-slug"},
 	)
 
 	if got := ctx.Param("id"); got != "42" {
@@ -56,54 +58,58 @@ func TestContextParam(t *testing.T) {
 	}
 }
 
+func TestContextParamWithoutHandler(t *testing.T) {
+	ctx := getContext()
+	defer putContext(ctx)
+
+	ctx.segments = append(ctx.segments, seg{Value: "42"})
+	if got := ctx.Param("id"); got != "" {
+		t.Fatalf("Param(%q) = %q without handler, want empty string", "id", got)
+	}
+}
+
+func TestContextParamUsesShortestPartsAndSegmentsLength(t *testing.T) {
+	ctx := getContext()
+	defer putContext(ctx)
+
+	entry := routeEntry{Parts: activeParts{"id", "slug"}}
+	ctx.handler = &entry
+	ctx.segments = append(ctx.segments, seg{Value: "42"})
+
+	if got := ctx.Param("id"); got != "42" {
+		t.Fatalf("Param(%q) = %q, want %q", "id", got, "42")
+	}
+	if got := ctx.Param("slug"); got != "" {
+		t.Fatalf("Param(%q) = %q with missing segment, want empty string", "slug", got)
+	}
+}
+
 func TestContextResetClearsFields(t *testing.T) {
 	ctx := getContext()
 	defer putContext(ctx)
 
-	ctx.handler.Route = "/test"
-	ctx.handler.Bitmask = 7
-	ctx.handler.Validation = true
-	ctx.handler.Parts = activeParts{"a", "b"}
-	ctx.handler.Patterns = []pattern{{Slug: "s"}}
-	ctx.fromCache = true
-
-	ctx.params = append(ctx.params, par{Key: "id", Value: "1"})
+	entry := routeEntry{
+		Route:      "/test",
+		Bitmask:    7,
+		Validation: true,
+		Parts:      activeParts{"a", "b"},
+		Patterns:   []pattern{{Slug: "s"}},
+	}
+	ctx.handler = &entry
+	ctx.allowedMask = 15
 	ctx.segments = append(ctx.segments, seg{Value: "seg"})
-	ctx.entries = append(ctx.entries, routeEntry{Route: "/x"})
 	ctx.store = append(ctx.store, kv{Key: "k", Value: "v"})
 
 	ctx.reset()
 
-	if ctx.handler.Route != "" {
-		t.Fatalf("Handler.Route = %q, want empty", ctx.handler.Route)
+	if ctx.handler != nil {
+		t.Fatalf("handler = %#v, want nil", ctx.handler)
 	}
-	if ctx.handler.Handler != nil {
-		t.Fatalf("Handler.Handler not nil after reset")
-	}
-	if ctx.handler.Bitmask != 0 {
-		t.Fatalf("Handler.Bitmask = %d, want 0", ctx.handler.Bitmask)
-	}
-	if ctx.handler.Validation {
-		t.Fatalf("Handler.Validation = true, want false")
-	}
-	if len(ctx.handler.Parts) != 0 {
-		t.Fatalf("len(Handler.Parts) = %d, want 0", len(ctx.handler.Parts))
-	}
-	if len(ctx.handler.Patterns) != 0 {
-		t.Fatalf("len(Handler.Patterns) = %d, want 0", len(ctx.handler.Patterns))
-	}
-
-	if ctx.fromCache {
-		t.Fatalf("fromCache = true, want false")
-	}
-	if len(ctx.params) != 0 {
-		t.Fatalf("len(Params) = %d, want 0", len(ctx.params))
+	if ctx.allowedMask != 0 {
+		t.Fatalf("allowedMask = %d, want 0", ctx.allowedMask)
 	}
 	if len(ctx.segments) != 0 {
 		t.Fatalf("len(Segments) = %d, want 0", len(ctx.segments))
-	}
-	if len(ctx.entries) != 0 {
-		t.Fatalf("len(Entries) = %d, want 0", len(ctx.entries))
 	}
 	if len(ctx.store) != 0 {
 		t.Fatalf("len(Store) = %d, want 0", len(ctx.store))
@@ -113,23 +119,33 @@ func TestContextResetClearsFields(t *testing.T) {
 func TestContextResetResizesLargeSlices(t *testing.T) {
 	ctx := &Context{}
 
-	ctx.params = make([]par, 0, 2048)
 	ctx.segments = make([]seg, 0, 2048)
-	ctx.entries = make([]routeEntry, 0, 2048)
 	ctx.store = make([]kv, 0, 256)
 
 	ctx.reset()
 
-	if cap(ctx.params) != 8 {
-		t.Fatalf("cap(Params) = %d, want 8", cap(ctx.params))
-	}
 	if cap(ctx.segments) != 8 {
 		t.Fatalf("cap(Segments) = %d, want 8", cap(ctx.segments))
 	}
-	if cap(ctx.entries) != 8 {
-		t.Fatalf("cap(Entries) = %d, want 8", cap(ctx.entries))
-	}
 	if cap(ctx.store) != 4 {
 		t.Fatalf("cap(Store) = %d, want 4", cap(ctx.store))
+	}
+}
+
+func TestContextResetRetainsReasonableCapacity(t *testing.T) {
+	ctx := &Context{
+		segments: make([]seg, 0, 16),
+		store:    make([]kv, 0, 8),
+	}
+	ctx.segments = append(ctx.segments, seg{Value: "x"})
+	ctx.store = append(ctx.store, kv{Key: "k", Value: "v"})
+
+	ctx.reset()
+
+	if cap(ctx.segments) != 16 {
+		t.Fatalf("cap(Segments) = %d, want retained capacity 16", cap(ctx.segments))
+	}
+	if cap(ctx.store) != 8 {
+		t.Fatalf("cap(Store) = %d, want retained capacity 8", cap(ctx.store))
 	}
 }

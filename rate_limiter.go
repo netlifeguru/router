@@ -130,7 +130,7 @@ func defaultRateLimitKey(r *http.Request, c *Context) string {
 	ip := ClientIP(r)
 
 	route := r.URL.Path
-	if c != nil && c.handler.Route != "" {
+	if c != nil && c.handler != nil && c.handler.Route != "" {
 		route = c.handler.Route
 	}
 

@@ -111,7 +111,8 @@ func TestDefaultRateLimitKeyWithContextRoute(t *testing.T) {
 	req.RemoteAddr = "198.51.100.5:9999"
 
 	ctx := &Context{}
-	ctx.handler.Route = "/api/v1/resource"
+	entry := routeEntry{Route: "/api/v1/resource"}
+	ctx.handler = &entry
 
 	key := defaultRateLimitKey(req, ctx)
 

@@ -1,13 +1,6 @@
 package router
 
-import (
-	"sync"
-)
-
-type par struct {
-	Key   string
-	Value string
-}
+import "sync"
 
 type seg struct {
 	Value string
@@ -19,12 +12,14 @@ type kv struct {
 }
 
 type Context struct {
-	handler   routeEntry
-	entries   []routeEntry
-	params    []par
-	segments  []seg
-	store     []kv
-	fromCache bool
+	// Keep independently-owned pooled contexts from sharing an assumed CPU
+	// cache line under parallel request load. See OPTIMIZATION.md.
+	_ contextCachePad
+
+	handler     *routeEntry
+	segments    []seg
+	store       []kv
+	allowedMask int
 }
 
 func (c *Context) Set(key string, value any) {
@@ -49,11 +44,19 @@ func (c *Context) Get(key string) any {
 }
 
 func (c *Context) Param(key string) string {
-	n := len(c.params)
+	if c.handler == nil {
+		return ""
+	}
+
+	parts := c.handler.Parts
+	n := len(parts)
+	if len(c.segments) < n {
+		n = len(c.segments)
+	}
 
 	for i := 0; i < n; i++ {
-		if c.params[i].Key == key {
-			return c.params[i].Value
+		if parts[i] == key {
+			return c.segments[i].Value
 		}
 	}
 
@@ -61,25 +64,13 @@ func (c *Context) Param(key string) string {
 }
 
 func (c *Context) reset() {
-	c.handler = routeEntry{}
-	c.fromCache = false
-
-	if cap(c.params) > 1024 {
-		c.params = make([]par, 0, 8)
-	} else {
-		c.params = c.params[:0]
-	}
+	c.handler = nil
+	c.allowedMask = 0
 
 	if cap(c.segments) > 1024 {
 		c.segments = make([]seg, 0, 8)
 	} else {
 		c.segments = c.segments[:0]
-	}
-
-	if cap(c.entries) > 1024 {
-		c.entries = make([]routeEntry, 0, 8)
-	} else {
-		c.entries = c.entries[:0]
 	}
 
 	if cap(c.store) > 128 {
@@ -95,10 +86,8 @@ func (c *Context) reset() {
 var contextPool = sync.Pool{
 	New: func() any {
 		return &Context{
-			params:   make([]par, 0, 8),
 			segments: make([]seg, 0, 8),
 			store:    make([]kv, 0, 4),
-			entries:  make([]routeEntry, 0, 8),
 		}
 	},
 }
